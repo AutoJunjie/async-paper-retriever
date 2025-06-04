@@ -36,7 +36,7 @@ class Settings(BaseSettings):
     
     # DynamoDB缓存配置
     ENABLE_CACHE: bool = os.getenv("ENABLE_CACHE", "true").lower() == "true"
-    DYNAMODB_TABLE_NAME: str = os.getenv("DYNAMODB_TABLE_NAME", "async-search-cache")
+    DYNAMODB_TABLE_NAME: str = os.getenv("DYNAMODB_TABLE_NAME", "asyncSearchCache")
     DYNAMODB_REGION: str = os.getenv("DYNAMODB_REGION", "us-east-1")
     AWS_ACCESS_KEY_ID: Optional[str] = os.getenv("AWS_ACCESS_KEY_ID")
     AWS_SECRET_ACCESS_KEY: Optional[str] = os.getenv("AWS_SECRET_ACCESS_KEY")

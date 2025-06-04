@@ -36,6 +36,30 @@ const MedicalPaperDashboard = () => {
     return () => clearInterval(interval);
   }, []);
 
+  // 在组件挂载时加载历史任务
+  useEffect(() => {
+    const loadSearchHistory = async () => {
+      try {
+        console.log('正在加载搜索历史...');
+        const historyTasks = await apiService.getSearchHistory(50);
+        console.log(`加载了 ${historyTasks.length} 个历史任务`);
+        setTasks(historyTasks);
+        
+        // 如果有历史任务且没有选中的任务，自动选中第一个
+        if (historyTasks.length > 0 && !selectedTask) {
+          setSelectedTask(historyTasks[0]);
+        }
+      } catch (error) {
+        console.error('加载搜索历史失败:', error);
+      }
+    };
+
+    // 只在后端在线时加载历史
+    if (backendStatus === 'online') {
+      loadSearchHistory();
+    }
+  }, [backendStatus]); // 依赖后端状态
+
   // 监听任务状态更新事件
   useEffect(() => {
     const handleTaskStatusUpdate = (event: CustomEvent) => {
@@ -114,9 +138,27 @@ const MedicalPaperDashboard = () => {
       )
     : [];
 
-  const handleTaskSelect = (task: SearchTask) => {
+  const handleTaskSelect = async (task: SearchTask) => {
     setSelectedTask(task);
     setCurrentPage(1); // 重置分页
+    
+    // 如果任务没有结果，尝试懒加载
+    if (task.results.length === 0 && task.status === 'Completed') {
+      try {
+        console.log(`懒加载任务 "${task.keyword}" 的详细结果...`);
+        const taskWithResults = await apiService.loadTaskResults(task);
+        
+        // 更新tasks列表中的任务
+        setTasks(prevTasks => 
+          prevTasks.map(t => t.id === task.id ? taskWithResults : t)
+        );
+        
+        // 更新选中的任务
+        setSelectedTask(taskWithResults);
+      } catch (error) {
+        console.error('懒加载任务结果失败:', error);
+      }
+    }
   };
 
   const handlePageChange = (page: number) => {

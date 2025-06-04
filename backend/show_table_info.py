@@ -17,7 +17,7 @@ from botocore.exceptions import ClientError
 
 dynamodb = boto3.resource('dynamodb', region_name=settings.DYNAMODB_REGION)
 
-tables_to_check = ['async-search-cache', 'asyncSearchCache']
+tables_to_check = ['asyncSearchCache', 'asyncSearchCache']
 
 for table_name in tables_to_check:
     try:
@@ -42,4 +42,4 @@ print(f"\n💡 建议:")
 print(f"   如果您想使用 asyncSearchCache 表，请在 .env 文件中添加:")
 print(f"   DYNAMODB_TABLE_NAME=asyncSearchCache")
 print(f"   ")
-print(f"   如果您想使用 async-search-cache 表，请确保该表存在且主键为 cache_key") 
+print(f"   如果您想使用 asyncSearchCache 表，请确保该表存在且主键为 cache_key") 

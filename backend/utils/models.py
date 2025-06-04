@@ -30,4 +30,9 @@ class SearchResponse(BaseModel):
     results: List[SearchResult] = Field(..., description="搜索结果列表")
     searchType: str = Field(..., description="搜索类型")
     rewrittenTerms: Optional[List[str]] = Field(None, description="重写的搜索词")
-    search_id: Optional[str] = Field(None, description="搜索缓存ID") 
+    search_id: Optional[str] = Field(None, description="搜索缓存ID")
+
+class AsyncSearchInitiatedResponse(BaseModel):
+    """异步搜索启动响应模型"""
+    search_id: str = Field(..., description="生成的后台搜索任务ID")
+    message: str = Field("Search initiated. Poll /cache/{search_id} for results.", description="提示信息") 

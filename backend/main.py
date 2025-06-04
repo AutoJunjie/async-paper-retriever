@@ -7,13 +7,14 @@ import json
 import re
 import urllib.parse
 import openai
-from typing import List, Tuple
+from typing import List, Tuple, Optional
+from datetime import datetime, timezone
 
 # 加载环境变量
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI
+from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from opensearchpy import OpenSearch
 
@@ -24,8 +25,8 @@ from utils.embedding import BGEM3Embedder
 from utils.rerank import BGEReranker
 from utils.query_expansion import expand_query
 from utils.settings import settings
-from utils.models import SearchRequest, SearchResult, SearchResponse
-from utils.s3_cache import S3Cache
+from utils.models import SearchRequest, SearchResult, SearchResponse, AsyncSearchInitiatedResponse
+from utils.search_cache import SearchCache
 
 # 禁用Python字节码缓存
 os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
@@ -54,18 +55,12 @@ class AsyncPaperSearch:
     def _init_cache(self):
         """初始化S3+DynamoDB缓存"""
         try:
-            if settings.USE_S3_CACHE:
-                self.cache = S3Cache(
-                    bucket_name=settings.S3_BUCKET_NAME,
-                    table_name=settings.DYNAMODB_TABLE_NAME,
-                    region_name=settings.DYNAMODB_REGION
-                )
-                print("✅ S3+DynamoDB缓存初始化成功")
-            else:
-                # 如果不使用S3缓存，可以回退到原来的DynamoDB缓存
-                from utils.dynamodb_cache import DynamoDBCache
-                self.cache = DynamoDBCache()
-                print("✅ DynamoDB缓存初始化成功")
+            self.cache = SearchCache(
+                bucket_name=settings.S3_BUCKET_NAME,
+                table_name=settings.DYNAMODB_TABLE_NAME,
+                region_name=settings.DYNAMODB_REGION
+            )
+            print("✅ S3+DynamoDB缓存初始化成功 (使用 SearchCache)")
         except Exception as e:
             print(f"❌ 缓存初始化失败: {e}")
             self.cache = None
@@ -381,6 +376,21 @@ JSON 结构如下：{{
                     searchType=request.searchType,
                     rewrittenTerms=None
                 )
+
+            # 首先尝试从缓存中获取结果
+            if self.cache:
+                cached_response = self.cache.get_cached_response_by_query_and_type(
+                    query_text=query,
+                    search_type=request.searchType,
+                    enable_llm=request.enableLlm
+                )
+                if cached_response:
+                    print(f"✅ 缓存命中！查询: '{query}', 类型: {request.searchType}, LLM: {request.enableLlm}. 返回缓存结果 (ID: {cached_response.search_id})")
+                    # 确保search_id在返回的响应中，如果缓存中没有，则可能需要重新生成或标记
+                    # 但get_cached_response_by_query_and_type应该已经处理了search_id的填充
+                    return cached_response
+                else:
+                    print(f"ℹ️  缓存未命中。查询: '{query}', 类型: {request.searchType}, LLM: {request.enableLlm}. 继续执行搜索...")
             
             print(f"搜索类型: {request.searchType}, 查询: {query}")
             
@@ -694,6 +704,247 @@ JSON 结构如下：{{
         
         return results
 
+    async def _perform_search_task(self, request: SearchRequest, search_id_for_cache: str):
+        """执行实际的搜索并在后台缓存结果 (供异步API使用)"""
+        try:
+            print(f"⚙️ [AsyncSearchTask: {search_id_for_cache}] 开始执行异步搜索")
+            
+            # 检查OpenSearch是否可用
+            if not self.opensearch_client:
+                print(f"❌ [AsyncSearchTask: {search_id_for_cache}] OpenSearch服务不可用，任务中止")
+                if self.cache:
+                    try:
+                        self.cache.table.put_item(Item={
+                            self.cache.primary_key: search_id_for_cache,
+                            'search_id': search_id_for_cache,
+                            'query': request.query,
+                            'search_type': request.searchType,
+                            'status': 'ERROR',
+                            'error_message': 'OpenSearch服务不可用',
+                            'timestamp': datetime.now(timezone.utc).isoformat(),
+                            'created_at': int(datetime.now(timezone.utc).timestamp())
+                        })
+                    except Exception as e_cache:
+                        print(f"❌ [AsyncSearchTask: {search_id_for_cache}] 记录错误失败: {e_cache}")
+                return
+
+            # URL解码
+            try:
+                query = urllib.parse.unquote(request.query)
+            except Exception:
+                query = request.query
+
+            if not query:
+                print(f"⚠️ [AsyncSearchTask: {search_id_for_cache}] 查询为空，任务中止")
+                return
+
+            # 查询扩展
+            query_terms = expand_query(query)
+            print(f"扩展后的搜索词 (异步任务 {search_id_for_cache}): {query_terms}")
+            
+            # 执行搜索并保存结果，使用预生成的search_id
+            if request.searchType == 'hybrid':
+                search_response = await self._hybrid_search_with_id(query, query_terms, request, search_id_for_cache)
+            elif request.searchType == 'vector':
+                search_response = await self._vector_search_with_id(query, query_terms, request, search_id_for_cache)
+            else:
+                search_response = await self._keyword_search_with_id(query, query_terms, request, search_id_for_cache)
+            
+            print(f"✅ [AsyncSearchTask: {search_id_for_cache}] 异步搜索任务完成")
+
+        except Exception as e:
+            print(f"❌ [AsyncSearchTask: {search_id_for_cache}] 异步搜索任务执行失败: {str(e)}")
+            if self.cache:
+                try:
+                    self.cache.table.put_item(Item={
+                        self.cache.primary_key: search_id_for_cache,
+                        'search_id': search_id_for_cache,
+                        'query': request.query,
+                        'search_type': request.searchType,
+                        'enable_llm': request.enableLlm,
+                        'status': 'ERROR',
+                        'error_message': str(e),
+                        'timestamp': datetime.now(timezone.utc).isoformat(),
+                        'created_at': int(datetime.now(timezone.utc).timestamp())
+                    })
+                except Exception as ddb_e:
+                    print(f"❌ [AsyncSearchTask: {search_id_for_cache}] 无法记录错误状态: {ddb_e}")
+
+    async def _hybrid_search_with_id(self, query: str, query_terms: List[str], request: SearchRequest, search_id: str) -> SearchResponse:
+        """混合搜索 - 异步版本，使用预生成的search_id"""
+        if not self.embedder:
+            raise Exception("嵌入服务不可用，无法执行混合搜索")
+            
+        query_embedding = self.embedder.get_embeddings(query)[0].tolist()
+        search_query = self.build_hybrid_search_query(query_terms, query_embedding, request.page, request.pageSize)
+        
+        search_params = {"search_pipeline": "nlp-search-pipeline"}
+        
+        response = self.opensearch_client.search(
+            index=settings.OPENSEARCH_INDEX_NAME,
+            body=search_query,
+            params=search_params
+        )
+        
+        results = []
+        for hit in response['hits']['hits']:
+            matched_keywords = self.find_matched_keywords(query_terms, hit['_source'])
+            highlight_matched = self.extract_matched_keywords(hit.get('highlight', {}))
+            
+            result = SearchResult(
+                id=hit['_source']['id'],
+                title=hit['_source']['title'],
+                keywords=hit['_source'].get('keywords', []),
+                abstract=hit['_source']['abstract'],
+                score=hit['_score'],
+                source='hybrid',
+                matched_keywords=matched_keywords + highlight_matched
+            )
+            results.append(result)
+        
+        if settings.ENABLE_RERANK and self.reranker and results:
+            results = await self._rerank_results(query, results)
+        
+        search_response = SearchResponse(
+            total=response['hits']['total']['value'],
+            results=results,
+            searchType=request.searchType,
+            rewrittenTerms=query_terms,
+            search_id=search_id
+        )
+        
+        # 保存搜索结果到缓存，使用预生成的search_id
+        if self.cache:
+            self.cache.save_search_result(
+                query=query,
+                search_type=request.searchType,
+                response=search_response,
+                enable_llm=request.enableLlm,
+                search_id=search_id
+            )
+        
+        return search_response
+
+    async def _vector_search_with_id(self, query: str, query_terms: List[str], request: SearchRequest, search_id: str) -> SearchResponse:
+        """向量搜索 - 异步版本，使用预生成的search_id"""
+        if not self.embedder:
+            raise Exception("嵌入服务不可用，无法执行向量搜索")
+            
+        query_embedding = self.embedder.get_embeddings(query)[0].tolist()
+        search_query = self.build_vector_search_query(query_embedding, query_terms, request.page, request.pageSize)
+        
+        response = self.opensearch_client.search(
+            index=settings.OPENSEARCH_INDEX_NAME,
+            body=search_query
+        )
+        
+        results = []
+        for hit in response['hits']['hits']:
+            eval_text = f"标题：{hit['_source']['title']}\n摘要：{hit['_source']['abstract']}"
+            is_relevant, reason = self.evaluate_relevance(query, eval_text, request.enableLlm)
+            
+            if is_relevant:
+                result = SearchResult(
+                    id=hit['_source']['id'],
+                    title=hit['_source']['title'],
+                    keywords=hit['_source'].get('keywords', []),
+                    abstract=hit['_source']['abstract'],
+                    score=hit['_score'],
+                    source='vector',
+                    relevance_reason=reason
+                )
+                results.append(result)
+        
+        search_response = SearchResponse(
+            total=len(results),
+            results=results,
+            searchType=request.searchType,
+            rewrittenTerms=query_terms,
+            search_id=search_id
+        )
+        
+        if self.cache:
+            self.cache.save_search_result(
+                query=query,
+                search_type=request.searchType,
+                response=search_response,
+                enable_llm=request.enableLlm,
+                search_id=search_id
+            )
+        
+        return search_response
+
+    async def _keyword_search_with_id(self, query: str, query_terms: List[str], request: SearchRequest, search_id: str) -> SearchResponse:
+        """关键词搜索 - 异步版本，使用预生成的search_id"""
+        search_query = self.build_keyword_search_query(query_terms, request.page, request.pageSize)
+        
+        response = self.opensearch_client.search(
+            index=settings.OPENSEARCH_INDEX_NAME,
+            body=search_query
+        )
+        
+        results = []
+        seen_ids = set()
+        
+        for hit in response['hits']['hits']:
+            matched_keywords = self.find_matched_keywords(query_terms, hit['_source'])
+            highlight_matched = self.extract_matched_keywords(hit.get('highlight', {}))
+            
+            result = SearchResult(
+                id=hit['_source']['id'],
+                title=hit['_source']['title'],
+                keywords=hit['_source'].get('keywords', []),
+                abstract=hit['_source']['abstract'],
+                score=hit['_score'],
+                source='keyword',
+                matched_keywords=matched_keywords + highlight_matched
+            )
+            results.append(result)
+            seen_ids.add(hit['_source']['id'])
+        
+        if len(results) < 10000 and self.embedder:
+            results = await self._supplement_with_vector_search(query, query_terms, results, seen_ids, request)
+        
+        if settings.ENABLE_RERANK and self.reranker and results:
+            results = await self._rerank_results(query, results)
+        
+        search_response = SearchResponse(
+            total=len(results),
+            results=results,
+            searchType=request.searchType,
+            rewrittenTerms=query_terms,
+            search_id=search_id
+        )
+        
+        if self.cache:
+            self.cache.save_search_result(
+                query=query,
+                search_type=request.searchType,
+                response=search_response,
+                enable_llm=request.enableLlm,
+                search_id=search_id
+            )
+        
+        return search_response
+
+    async def search_async(self, request: SearchRequest, background_tasks: BackgroundTasks) -> AsyncSearchInitiatedResponse:
+        """启动异步搜索任务"""
+        if not self.cache:
+            print("❌ 缓存服务未初始化，无法执行异步搜索")
+            raise HTTPException(status_code=503, detail="缓存服务未初始化，无法执行异步搜索")
+
+        # 生成唯一的搜索ID
+        search_id = self.cache.generate_search_id()
+        
+        print(f"➡️ 接收到异步搜索请求. 查询: '{request.query}', 类型: {request.searchType}. 分配的任务ID: {search_id}")
+        
+        background_tasks.add_task(self._perform_search_task, request, search_id)
+        
+        return AsyncSearchInitiatedResponse(
+            search_id=search_id,
+            message=f"异步搜索任务已启动。使用任务ID '{search_id}' 通过 /cache/{{search_id}} 端点轮询结果。"
+        )
+
     def get_service_status(self) -> dict:
         """获取服务状态"""
         cache_type = "none"
@@ -762,12 +1013,17 @@ async def health_check():
     }
     return status
 
-@app.post("/search", response_model=SearchResponse)
+@app.post("/search", response_model=SearchResponse, tags=["Search"])
 async def search_post(request: SearchRequest):
     """POST方式搜索"""
     return await search_engine.search(request)
 
-@app.get("/cache/{search_id}")
+@app.post("/search/async", response_model=AsyncSearchInitiatedResponse, tags=["Search"])
+async def search_async_post(request: SearchRequest, background_tasks: BackgroundTasks):
+    """启动一个异步搜索任务，立即返回任务ID。前端可轮询 /cache/{search_id} 获取结果。"""
+    return await search_engine.search_async(request, background_tasks)
+
+@app.get("/cache/{search_id}", tags=["Cache"])
 async def get_cached_search(search_id: str):
     """根据搜索ID获取缓存的搜索结果"""
     if not search_engine.cache:
@@ -815,6 +1071,49 @@ async def delete_cached_search(search_id: str):
         return {"message": f"搜索结果已删除: {search_id}"}
     else:
         return {"error": f"删除失败: {search_id}"}
+
+@app.get("/search/history", tags=["Search"])
+async def get_search_history(limit: int = 50):
+    """获取搜索历史记录"""
+    if not search_engine.cache:
+        return {"error": "缓存未初始化"}
+    
+    try:
+        # 使用DynamoDB scan来获取所有搜索记录
+        response = search_engine.cache.table.scan(
+            Limit=limit,
+            ProjectionExpression="search_id, #q, search_type, enable_llm, total_results, results_count, #ts, created_at",
+            ExpressionAttributeNames={
+                '#q': 'query',  # query是DynamoDB的保留字，需要使用别名
+                '#ts': 'timestamp'  # timestamp是DynamoDB的保留字，需要使用别名
+            }
+        )
+        
+        items = response.get('Items', [])
+        
+        # 按创建时间降序排序
+        items.sort(key=lambda x: x.get('created_at', 0), reverse=True)
+        
+        # 转换为前端需要的格式
+        history = []
+        for item in items:
+            history_item = {
+                "search_id": item.get('search_id'),
+                "query": item.get('query'),
+                "search_type": item.get('search_type'),
+                "enable_llm": item.get('enable_llm', False),
+                "total_results": item.get('total_results'),
+                "results_count": item.get('results_count', 0),
+                "timestamp": item.get('timestamp'),
+                "created_at": item.get('created_at')
+            }
+            history.append(history_item)
+        
+        return {"history": history, "count": len(history)}
+        
+    except Exception as e:
+        print(f"❌ 获取搜索历史失败: {e}")
+        return {"error": f"获取搜索历史失败: {str(e)}"}
 
 if __name__ == "__main__":
     import uvicorn
