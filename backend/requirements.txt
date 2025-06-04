@@ -1,0 +1,14 @@
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+opensearch-py
+numpy
+boto3
+botocore
+typing-extensions>=4.0.0 
+openai
+python-dotenv
+requests
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+pytest>=7.0.0
+httpx>=0.24.0

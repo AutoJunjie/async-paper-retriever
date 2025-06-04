@@ -1,0 +1,31 @@
+{
+    "Rules": [
+        {
+            "ID": "DeleteOldSearchResults",
+            "Status": "Enabled",
+            "Filter": {
+                "Prefix": "search-results/"
+            },
+            "Expiration": {
+                "Days": 30
+            }
+        },
+        {
+            "ID": "TransitionToIA",
+            "Status": "Enabled",
+            "Filter": {
+                "Prefix": "search-results/"
+            },
+            "Transitions": [
+                {
+                    "Days": 7,
+                    "StorageClass": "STANDARD_IA"
+                },
+                {
+                    "Days": 14,
+                    "StorageClass": "GLACIER"
+                }
+            ]
+        }
+    ]
+} 
